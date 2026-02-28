@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""TextStream — Live speech-to-text streaming with swappable ASR engines.
+"""TextStream — Live speech-to-text streaming on Apple Silicon.
 
-Supports Parakeet TDT (fast, ~6% WER) and Qwen3-ASR (accurate, ~2.3% WER).
-Streams results to a browser (SSE) and Grafana Cloud (annotations).
-Saves daily transcripts to documents/transcripts/YYYY-MM-DD/.
+Streams live microphone audio through Qwen3-ASR, displays results in a
+browser (SSE), optionally pushes Grafana annotations, and saves daily
+transcripts to ~/Documents/textstream/transcripts/YYYY-MM-DD/.
 
 Usage:
-    python server.py                    # Start with Qwen3-ASR 0.6B (default)
-    python server.py --engine parakeet  # Use Parakeet v2
-    python server.py --engine qwen-1.7b # Use Qwen3-ASR 1.7B (higher accuracy)
-    python server.py --interval 2.5     # Seconds between streaming updates
-    python server.py --port 8080        # Custom port
+    textstream                          # Start with Qwen3-ASR 0.6B (default)
+    textstream --engine qwen-1.7b       # Use Qwen3-ASR 1.7B (higher accuracy)
+    textstream --vad-threshold 0.5      # Stricter voice activity detection
+    textstream --interval 2.5           # Seconds between streaming updates
+    textstream --port 8080              # Custom port
 """
 
 import sys
@@ -34,15 +34,12 @@ import sounddevice as sd
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SAMPLE_RATE = 16000
-SILENCE_RMS = 0.015  # raised to reject music/ambient noise better
 DEFAULT_PORT = 7890
 DEFAULT_INTERVAL = 2.5
+DEFAULT_VAD_THRESHOLD = 0.4
 
 GRAFANA_URL = os.environ.get("GRAFANA_URL", "https://triscient.grafana.net")
-GRAFANA_TOKEN = os.environ.get(
-    "GRAFANA_SERVICE_ACCOUNT_TOKEN",
-    "glsa_Ug6swwrUH57IzEjfuK3d0S4XrBm36R1y_d7ef78e8",
-)
+GRAFANA_TOKEN = os.environ.get("GRAFANA_SERVICE_ACCOUNT_TOKEN", "")
 
 # ── State ─────────────────────────────────────────────────────────────────────
 audio_chunks = []
@@ -114,7 +111,7 @@ def push_annotation(text):
 
 
 # ── Transcript File Persistence ───────────────────────────────────────────────
-TRANSCRIPT_DIR = Path(__file__).parent / "documents" / "transcripts"
+TRANSCRIPT_DIR = Path.home() / "Documents" / "textstream" / "transcripts"
 _transcript_file = None
 _transcript_lock = threading.Lock()
 
@@ -170,107 +167,6 @@ class ASREngine(ABC):
         """Reset streaming state (for engines that drift)."""
         self.stop()
         self.start()
-
-
-class ParakeetEngine(ASREngine):
-    description = "Parakeet TDT 0.6B — fast (~1min/hr), ~6% WER"
-
-    MAX_STREAM_CHUNKS = 200
-
-    def __init__(self, model_variant="v2"):
-        self.name = "parakeet" if model_variant == "v2" else "parakeet-v3"
-        self.model_variant = model_variant
-        self.model = None
-        self._ctx = None
-        self._transcriber = None
-        self._session_chunks = 0
-        self._prev_finalized_count = 0
-
-    def load(self):
-        model_map = {
-            "v2": "mlx-community/parakeet-tdt-0.6b-v2",
-            "v3": "mlx-community/parakeet-tdt-0.6b-v3",
-        }
-        log(f"Loading Parakeet {self.model_variant}...")
-        from parakeet_mlx import from_pretrained
-        self.model = from_pretrained(model_map[self.model_variant])
-        log("Parakeet ready")
-
-    def _new_stream(self):
-        from parakeet_mlx.parakeet import DecodingConfig, Beam
-        decoding = DecodingConfig(
-            decoding=Beam(beam_size=5, duration_reward=0.7),
-        )
-        return self.model.transcribe_stream(
-            context_size=(384, 384),
-            depth=4,
-            decoding_config=decoding,
-        )
-
-    def start(self):
-        if self.model is None:
-            self.load()
-        self._ctx = self._new_stream()
-        self._transcriber = self._ctx.__enter__()
-        self._session_chunks = 0
-        self._prev_finalized_count = 0
-
-    def feed(self, audio_np):
-        import mlx.core as mx
-
-        self._session_chunks += 1
-
-        if self._session_chunks >= self.MAX_STREAM_CHUNKS:
-            log(f"  -- parakeet drift reset after {self.MAX_STREAM_CHUNKS} chunks --")
-            self.reset()
-
-        audio_mx = mx.array(audio_np)
-        self._transcriber.add_audio(audio_mx)
-
-        fin_tokens = self._transcriber.finalized_tokens
-        draft_tokens = self._transcriber.draft_tokens
-
-        fin_text = "".join(t.text for t in fin_tokens).strip()
-        draft_text = "".join(t.text for t in draft_tokens).strip()
-
-        # Track newly finalized text for persistence
-        new_fin_count = len(fin_tokens)
-        new_text = ""
-        if new_fin_count > self._prev_finalized_count:
-            new_text = "".join(
-                t.text for t in fin_tokens[self._prev_finalized_count:]
-            ).strip()
-            self._prev_finalized_count = new_fin_count
-
-        if new_text:
-            save_transcript(new_text)
-            threading.Thread(
-                target=push_annotation, args=(new_text,), daemon=True
-            ).start()
-
-        return fin_text, draft_text
-
-    def stop(self):
-        if self._ctx:
-            try:
-                self._ctx.__exit__(None, None, None)
-            except Exception:
-                pass
-        self._ctx = None
-        self._transcriber = None
-        self._session_chunks = 0
-        self._prev_finalized_count = 0
-        # Prevent MPS memory leak (parakeet-mlx #34)
-        try:
-            import mlx.core as mx
-            import gc
-            mx.clear_cache()
-            gc.collect()
-        except Exception:
-            pass
-
-    def needs_manual_reset(self):
-        return True
 
 
 class QwenEngine(ASREngine):
@@ -388,8 +284,10 @@ ENGINES = {
 SILENCE_STREAK_RESET = 4
 
 
-def transcription_loop(interval):
+def transcription_loop(interval, vad_threshold):
     global current_engine
+
+    from .vad import contains_speech
 
     broadcast({"type": "status", "content": "Listening..."})
     log("Listening - speak into your microphone (streaming mode)")
@@ -434,8 +332,7 @@ def transcription_loop(interval):
                 silence_streak = 0
             continue
 
-        rms = float(np.sqrt(np.mean(chunk ** 2)))
-        if rms < SILENCE_RMS:
+        if not contains_speech(chunk, threshold=vad_threshold):
             silence_streak += 1
             if silence_streak >= SILENCE_STREAK_RESET and engine.needs_manual_reset():
                 engine.reset()
@@ -772,6 +669,16 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     global running, current_engine
 
+    import platform
+
+    if platform.machine() != "arm64" or platform.system() != "Darwin":
+        print(
+            "TextStream requires Apple Silicon (M1/M2/M3/M4). "
+            "MLX does not run on Intel Macs or Linux.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     parser = argparse.ArgumentParser(description="TextStream - live speech to text")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument(
@@ -783,11 +690,15 @@ def main():
         "--interval", type=float, default=DEFAULT_INTERVAL,
         help=f"Seconds between streaming updates (default: {DEFAULT_INTERVAL})",
     )
+    parser.add_argument(
+        "--vad-threshold", type=float, default=DEFAULT_VAD_THRESHOLD,
+        help=f"Silero VAD speech probability threshold (default: {DEFAULT_VAD_THRESHOLD})",
+    )
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--no-grafana", action="store_true", help="Disable Grafana push")
     args = parser.parse_args()
 
-    if args.no_grafana:
+    if args.no_grafana or not GRAFANA_TOKEN:
         global push_annotation
         push_annotation = lambda text: None
 
@@ -806,7 +717,7 @@ def main():
     log("Microphone active")
 
     t = threading.Thread(
-        target=transcription_loop, args=(args.interval,), daemon=True
+        target=transcription_loop, args=(args.interval, args.vad_threshold), daemon=True
     )
     t.start()
 

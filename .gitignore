@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .DS_Store
 documents/transcripts/
+dist/
+build/
+*.egg-info/
