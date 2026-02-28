@@ -131,11 +131,8 @@ GET /          → built-in browser UI
 | `--interval` | 2.5 | Seconds between transcription updates |
 | `--vad-threshold` | 0.4 | Silero VAD speech probability threshold |
 | `--no-browser` | — | Don't open browser on start |
-| `--no-grafana` | — | Disable Grafana annotation push |
 
 Transcripts are saved to `~/Documents/textstream/transcripts/YYYY-MM-DD/`.
-
-Grafana integration reads `GRAFANA_URL` and `GRAFANA_SERVICE_ACCOUNT_TOKEN` from env. If the token is empty, push is skipped.
 
 ## Dependencies
 

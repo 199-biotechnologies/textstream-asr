@@ -22,8 +22,6 @@ import threading
 import queue
 import webbrowser
 import argparse
-import urllib.request
-import urllib.error
 from abc import ABC, abstractmethod
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -38,9 +36,6 @@ DEFAULT_PORT = 7890
 DEFAULT_INTERVAL = 2.5
 DEFAULT_VAD_THRESHOLD = 0.4
 
-GRAFANA_URL = os.environ.get("GRAFANA_URL", "https://triscient.grafana.net")
-GRAFANA_TOKEN = os.environ.get("GRAFANA_SERVICE_ACCOUNT_TOKEN", "")
-
 # ── State ─────────────────────────────────────────────────────────────────────
 audio_queue = queue.Queue(maxsize=int(SAMPLE_RATE * 10 / 1600))  # Cap ~10s of audio
 subscribers = []
@@ -50,7 +45,6 @@ paused = False
 current_engine = None
 engine_lock = threading.Lock()
 pending_engine_name = None  # Set by /switch, consumed by transcription loop
-annotation_queue = queue.Queue(maxsize=100)
 
 
 def log(msg):
@@ -97,48 +91,6 @@ def broadcast(event_data):
                 dead.append(q)
         for d in dead:
             subscribers.remove(d)
-
-
-# ── Grafana Annotation Push ───────────────────────────────────────────────────
-def _push_annotation_http(text):
-    try:
-        payload = json.dumps({
-            "text": text,
-            "tags": ["textstream"],
-            "time": int(time.time() * 1000),
-        }).encode()
-        req = urllib.request.Request(
-            f"{GRAFANA_URL}/api/annotations",
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {GRAFANA_TOKEN}",
-                "User-Agent": "textstream/1.0",
-            },
-        )
-        urllib.request.urlopen(req, timeout=5)
-    except Exception as e:
-        log(f"grafana push failed: {e}")
-
-
-def _annotation_worker():
-    """Single background thread draining annotation_queue."""
-    while running:
-        try:
-            text = annotation_queue.get(timeout=1)
-            _push_annotation_http(text)
-        except queue.Empty:
-            continue
-        except Exception:
-            continue
-
-
-def push_annotation(text):
-    """Queue an annotation for async push (non-blocking)."""
-    try:
-        annotation_queue.put_nowait(text)
-    except queue.Full:
-        pass
 
 
 # ── Transcript File Persistence ───────────────────────────────────────────────
@@ -286,7 +238,6 @@ class QwenEngine(ASREngine):
             # Don't persist hallucinated text
             if new_text and not self._is_hallucination(new_text):
                 save_transcript(new_text)
-                push_annotation(new_text)
             self._prev_stable_len = len(stable)
 
         return stable, draft
@@ -300,7 +251,6 @@ class QwenEngine(ASREngine):
                     remaining = final[self._prev_stable_len:].strip()
                     if remaining:
                         save_transcript(remaining)
-                        push_annotation(remaining)
             except Exception as e:
                 log(f"qwen finish error: {e}")
         self._state = None
@@ -755,14 +705,7 @@ def main():
         help=f"Silero VAD speech probability threshold (default: {DEFAULT_VAD_THRESHOLD})",
     )
     parser.add_argument("--no-browser", action="store_true")
-    parser.add_argument("--no-grafana", action="store_true", help="Disable Grafana push")
     args = parser.parse_args()
-
-    if args.no_grafana or not GRAFANA_TOKEN:
-        global push_annotation
-        push_annotation = lambda text: None
-    else:
-        threading.Thread(target=_annotation_worker, daemon=True).start()
 
     # Limit MLX Metal cache to prevent memory pressure on 8/16GB Macs
     try:
@@ -794,8 +737,7 @@ def main():
     httpd = ThreadedServer(("127.0.0.1", args.port), Handler)
 
     url = f"http://localhost:{args.port}"
-    log(f"Browser:  {url}")
-    log(f"Grafana:  annotations tagged 'textstream'")
+    log(f"Server:   {url}")
     log(f"Interval: {args.interval}s streaming updates")
 
     if not args.no_browser:
