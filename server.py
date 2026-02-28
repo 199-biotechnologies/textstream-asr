@@ -237,104 +237,97 @@ HTML = r"""<!DOCTYPE html>
 html,body{height:100%;overflow:hidden}
 body{
   background:#09090b;
-  color:#fafafa;
-  font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Inter','Helvetica Neue',sans-serif;
-  display:flex;align-items:center;justify-content:center;
+  color:#e8e8e8;
+  font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',sans-serif;
+  display:flex;align-items:flex-end;justify-content:flex-start;
 }
-.wrap{max-width:860px;width:100%;padding:2.5rem;text-align:center}
-#transcript{
-  font-size:2rem;
+.wrap{
+  width:100%;max-width:900px;
+  padding:0 3rem 5rem;
+  margin:0 auto;
+}
+#text{
+  font-size:1.65rem;
+  font-weight:350;
+  line-height:1.7;
+  letter-spacing:-0.01em;
+  text-align:left;
+  word-wrap:break-word;
+}
+#text .draft{
+  color:#666;
+}
+#status{
+  font-size:1.1rem;
+  color:#444;
   font-weight:300;
-  line-height:1.8;
-  letter-spacing:-0.015em;
-  min-height:200px;
-  display:flex;
-  flex-direction:column;
-  align-items:center;
-  justify-content:center;
-  gap:0.2em;
+  padding-bottom:1rem;
 }
-.fin{opacity:0.9;transition:opacity 0.4s}
-.fin-old{opacity:0.25;filter:blur(0.5px)}
-.fin-mid{opacity:0.5}
-.fin-new{opacity:0.9}
-.draft{
-  opacity:0.4;
-  font-style:italic;
-  color:#a0a0a0;
-  transition:opacity 0.3s;
-}
-.line{animation:arrive 0.35s ease-out}
-@keyframes arrive{
-  from{opacity:0;filter:blur(3px);transform:translateY(6px)}
-  to{opacity:1;filter:blur(0);transform:translateY(0)}
-}
-.status-msg{color:#555;font-style:italic;font-weight:300;font-size:1.3rem}
 .bar{
-  position:fixed;bottom:1.8rem;left:50%;transform:translateX(-50%);
-  display:flex;align-items:center;gap:0.5rem;
-  font-size:0.6rem;color:#333;letter-spacing:0.15em;text-transform:uppercase;
+  position:fixed;bottom:1.4rem;right:2rem;
+  display:flex;align-items:center;gap:0.4rem;
+  font-size:0.55rem;color:#2a2a2a;letter-spacing:0.12em;text-transform:uppercase;
   font-weight:500;
 }
 .dot{
-  width:5px;height:5px;border-radius:50%;
+  width:4px;height:4px;border-radius:50%;
   background:#34d399;
-  animation:pulse 2.5s ease-in-out infinite;
+  animation:pulse 3s ease-in-out infinite;
 }
-@keyframes pulse{0%,100%{opacity:0.3;transform:scale(0.9)}50%{opacity:1;transform:scale(1.1)}}
+@keyframes pulse{0%,100%{opacity:0.2}50%{opacity:1}}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <div id="transcript">
-    <span class="status-msg">Loading model...</span>
-  </div>
+  <div id="status">Loading model...</div>
+  <div id="text"></div>
 </div>
 <div class="bar"><div class="dot"></div><span>textstream</span></div>
 <script>
-const el=document.getElementById('transcript');
-const MAX_SENTENCES=3;
-
-// Split text into sentences (rough)
-function splitSentences(text){
-  if(!text)return[];
-  // Split on sentence-ending punctuation followed by space or end
-  const parts=text.match(/[^.!?]*[.!?]+[\s]?|[^.!?]+$/g);
-  return parts?parts.map(s=>s.trim()).filter(Boolean):[text.trim()].filter(Boolean);
-}
+const textEl=document.getElementById('text');
+const statusEl=document.getElementById('status');
+let shownFin=0;
+const MAX_CHARS=400;
 
 const src=new EventSource('/stream');
 src.onmessage=e=>{
   const d=JSON.parse(e.data);
 
   if(d.type==='stream'){
-    const finSentences=splitSentences(d.finalized);
-    const recent=finSentences.slice(-MAX_SENTENCES);
-    const n=recent.length;
+    statusEl.style.display='none';
+    const fin=d.finalized||'';
+    const draft=d.draft||'';
 
-    let html=recent.map((s,i)=>{
-      const age=n-1-i;
-      const cls=age===0?'fin-new line':age===1?'fin-mid':'fin-old';
-      return `<div class="fin ${cls}">${s}</div>`;
-    }).join('');
-
-    if(d.draft){
-      html+=`<div class="draft line">${d.draft}</div>`;
+    // Build visible text: tail of finalized + draft
+    // Only show last MAX_CHARS of finalized for performance
+    let visFin=fin;
+    if(visFin.length>MAX_CHARS){
+      // Cut at a space boundary
+      const cut=visFin.indexOf(' ',visFin.length-MAX_CHARS);
+      visFin=cut>0?visFin.slice(cut+1):visFin.slice(-MAX_CHARS);
     }
 
-    el.innerHTML=html;
-
-  }else if(d.type==='text'){
-    // Legacy chunk mode fallback
-    el.innerHTML=`<div class="fin fin-new line">${d.content}</div>`;
+    // Set innerHTML once: finalized as plain text, draft in span
+    if(draft){
+      textEl.innerHTML=esc(visFin)+'<span class="draft"> '+esc(draft)+'</span>';
+    }else{
+      textEl.textContent=visFin;
+    }
 
   }else if(d.type==='status'){
-    el.innerHTML=`<span class="status-msg">${d.content}</span>`;
+    statusEl.style.display='block';
+    statusEl.textContent=d.content;
   }
 };
 src.onerror=()=>{
-  el.innerHTML='<span class="status-msg">Reconnecting...</span>';
+  statusEl.style.display='block';
+  statusEl.textContent='Reconnecting...';
 };
+function esc(s){
+  const d=document.createElement('div');
+  d.textContent=s;
+  return d.innerHTML;
+}
 </script>
 </body>
 </html>"""
@@ -353,6 +346,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(HTML.encode())
+
+        elif self.path == "/stop":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"TextStream stopped.\n")
+            log("Stop requested via /stop endpoint")
+            threading.Thread(target=lambda: os.kill(os.getpid(), signal.SIGTERM), daemon=True).start()
 
         elif self.path == "/stream":
             self.send_response(200)
