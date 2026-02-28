@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""TextStream — Live speech-to-text streaming via Parakeet ASR.
+"""TextStream — Live speech-to-text streaming with swappable ASR engines.
 
-Uses parakeet-mlx's native streaming API for near word-by-word transcription.
+Supports Parakeet TDT (fast, ~6% WER) and Qwen3-ASR (accurate, ~2.3% WER).
 Streams results to a browser (SSE) and Grafana Cloud (annotations).
 Saves daily transcripts to documents/transcripts/YYYY-MM-DD/.
 
 Usage:
-    python server.py                # Start with defaults (1.5s chunks, English)
-    python server.py --port 8080    # Custom port
-    python server.py --model v3     # Multilingual (25 languages)
-    python server.py --interval 1   # Faster updates (seconds between add_audio calls)
+    python server.py                    # Start with Qwen3-ASR 0.6B (default)
+    python server.py --engine parakeet  # Use Parakeet v2
+    python server.py --engine qwen-1.7b # Use Qwen3-ASR 1.7B (higher accuracy)
+    python server.py --interval 2.5     # Seconds between streaming updates
+    python server.py --port 8080        # Custom port
 """
 
 import sys
@@ -23,6 +24,7 @@ import webbrowser
 import argparse
 import urllib.request
 import urllib.error
+from abc import ABC, abstractmethod
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -34,7 +36,7 @@ import sounddevice as sd
 SAMPLE_RATE = 16000
 SILENCE_RMS = 0.012
 DEFAULT_PORT = 7890
-DEFAULT_INTERVAL = 2.5  # seconds between streaming updates
+DEFAULT_INTERVAL = 2.5
 
 GRAFANA_URL = os.environ.get("GRAFANA_URL", "https://triscient.grafana.net")
 GRAFANA_TOKEN = os.environ.get(
@@ -49,6 +51,8 @@ subscribers = []
 sub_lock = threading.Lock()
 running = True
 paused = False
+current_engine = None
+engine_lock = threading.Lock()
 
 
 def log(msg):
@@ -141,91 +145,291 @@ def save_transcript(text):
         f.flush()
 
 
-# ── Streaming Transcription Loop ─────────────────────────────────────────────
-SILENCE_STREAK_RESET = 4      # reset state after N consecutive silent intervals
-MAX_STREAM_CHUNKS = 200       # reset state after N chunks to prevent decoder drift
+# ── Engine Abstraction ────────────────────────────────────────────────────────
+class ASREngine(ABC):
+    name: str = "unknown"
+    description: str = ""
+
+    @abstractmethod
+    def start(self):
+        """Initialize streaming state."""
+
+    @abstractmethod
+    def feed(self, audio_np: np.ndarray) -> tuple[str, str]:
+        """Feed audio chunk, return (stable_text, draft_text)."""
+
+    @abstractmethod
+    def stop(self):
+        """Finalize and clean up streaming state."""
+
+    @abstractmethod
+    def needs_manual_reset(self) -> bool:
+        """Whether this engine needs periodic drift resets."""
+
+    def reset(self):
+        """Reset streaming state (for engines that drift)."""
+        self.stop()
+        self.start()
 
 
-def transcription_loop(model, interval):
-    import mlx.core as mx
+class ParakeetEngine(ASREngine):
+    description = "Parakeet TDT 0.6B — fast (~1min/hr), ~6% WER"
 
-    broadcast({"type": "status", "content": "Listening..."})
-    log("Listening - speak into your microphone (streaming mode)")
+    MAX_STREAM_CHUNKS = 200
 
-    from parakeet_mlx.parakeet import DecodingConfig, Beam
+    def __init__(self, model_variant="v2"):
+        self.name = "parakeet" if model_variant == "v2" else "parakeet-v3"
+        self.model_variant = model_variant
+        self.model = None
+        self._ctx = None
+        self._transcriber = None
+        self._session_chunks = 0
+        self._prev_finalized_count = 0
 
-    decoding = DecodingConfig(
-        decoding=Beam(beam_size=5, duration_reward=0.7),
-    )
+    def load(self):
+        model_map = {
+            "v2": "mlx-community/parakeet-tdt-0.6b-v2",
+            "v3": "mlx-community/parakeet-tdt-0.6b-v3",
+        }
+        log(f"Loading Parakeet {self.model_variant}...")
+        from parakeet_mlx import from_pretrained
+        self.model = from_pretrained(model_map[self.model_variant])
+        log("Parakeet ready")
 
-    def new_stream():
-        return model.transcribe_stream(
+    def _new_stream(self):
+        from parakeet_mlx.parakeet import DecodingConfig, Beam
+        decoding = DecodingConfig(
+            decoding=Beam(beam_size=5, duration_reward=0.7),
+        )
+        return self.model.transcribe_stream(
             context_size=(384, 384),
             depth=4,
             decoding_config=decoding,
         )
 
-    ctx = new_stream()
-    transcriber = ctx.__enter__()
+    def start(self):
+        if self.model is None:
+            self.load()
+        self._ctx = self._new_stream()
+        self._transcriber = self._ctx.__enter__()
+        self._session_chunks = 0
+        self._prev_finalized_count = 0
 
-    update_count = 0
-    session_chunks = 0
-    total_audio_sec = 0.0
-    total_infer_ms = 0.0
-    prev_finalized_count = 0
-    prev_text = ""
-    silence_streak = 0
+    def feed(self, audio_np):
+        import mlx.core as mx
 
-    def reset_stream(reason):
-        nonlocal transcriber, ctx, session_chunks, prev_finalized_count, prev_text, silence_streak
-        log(f"  -- stream reset ({reason}) --")
+        self._session_chunks += 1
+
+        if self._session_chunks >= self.MAX_STREAM_CHUNKS:
+            log(f"  -- parakeet drift reset after {self.MAX_STREAM_CHUNKS} chunks --")
+            self.reset()
+
+        audio_mx = mx.array(audio_np)
+        self._transcriber.add_audio(audio_mx)
+
+        fin_tokens = self._transcriber.finalized_tokens
+        draft_tokens = self._transcriber.draft_tokens
+
+        fin_text = "".join(t.text for t in fin_tokens).strip()
+        draft_text = "".join(t.text for t in draft_tokens).strip()
+
+        # Track newly finalized text for persistence
+        new_fin_count = len(fin_tokens)
+        new_text = ""
+        if new_fin_count > self._prev_finalized_count:
+            new_text = "".join(
+                t.text for t in fin_tokens[self._prev_finalized_count:]
+            ).strip()
+            self._prev_finalized_count = new_fin_count
+
+        if new_text:
+            save_transcript(new_text)
+            threading.Thread(
+                target=push_annotation, args=(new_text,), daemon=True
+            ).start()
+
+        return fin_text, draft_text
+
+    def stop(self):
+        if self._ctx:
+            try:
+                self._ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+        self._ctx = None
+        self._transcriber = None
+        self._session_chunks = 0
+        self._prev_finalized_count = 0
+        # Prevent MPS memory leak (parakeet-mlx #34)
         try:
-            ctx.__exit__(None, None, None)
+            import mlx.core as mx
+            import gc
+            mx.clear_cache()
+            gc.collect()
         except Exception:
             pass
-        ctx = new_stream()
-        transcriber = ctx.__enter__()
-        session_chunks = 0
-        prev_finalized_count = 0
-        prev_text = ""
-        silence_streak = 0
-        return ctx, transcriber
+
+    def needs_manual_reset(self):
+        return True
+
+
+class QwenEngine(ASREngine):
+    description = "Qwen3-ASR 0.6B — accurate (~2.3% WER), built-in context window"
+
+    def __init__(self, model_size="0.6b"):
+        self.model_size = model_size
+        self.name = "qwen" if model_size == "0.6b" else "qwen-1.7b"
+        self.session = None
+        self._state = None
+        self._prev_stable_len = 0
+
+    def load(self):
+        model_map = {
+            "0.6b": "Qwen/Qwen3-ASR-0.6B",
+            "1.7b": "Qwen/Qwen3-ASR-1.7B",
+        }
+        log(f"Loading Qwen3-ASR {self.model_size}...")
+        from mlx_qwen3_asr import Session
+        self.session = Session(model=model_map[self.model_size])
+        log("Qwen3-ASR ready")
+
+    def start(self):
+        if self.session is None:
+            self.load()
+        self._state = self.session.init_streaming(
+            chunk_size_sec=2.0,
+            max_context_sec=30.0,
+            finalization_mode="accuracy",
+            sample_rate=SAMPLE_RATE,
+            unfixed_chunk_num=2,
+            unfixed_token_num=5,
+        )
+        self._prev_stable_len = 0
+
+    def feed(self, audio_np):
+        self._state = self.session.feed_audio(audio_np, self._state)
+
+        stable = self._state.stable_text.strip()
+        full = self._state.text.strip()
+
+        # Draft = everything after stable
+        draft = ""
+        if len(full) > len(stable):
+            draft = full[len(stable):].strip()
+
+        # Track newly finalized text for persistence
+        new_text = ""
+        if len(stable) > self._prev_stable_len:
+            new_text = stable[self._prev_stable_len:].strip()
+            self._prev_stable_len = len(stable)
+
+        if new_text:
+            save_transcript(new_text)
+            threading.Thread(
+                target=push_annotation, args=(new_text,), daemon=True
+            ).start()
+
+        return stable, draft
+
+    def stop(self):
+        if self._state and self.session:
+            try:
+                self._state = self.session.finish_streaming(self._state)
+                final = self._state.stable_text.strip()
+                if len(final) > self._prev_stable_len:
+                    remaining = final[self._prev_stable_len:].strip()
+                    if remaining:
+                        save_transcript(remaining)
+                        threading.Thread(
+                            target=push_annotation, args=(remaining,), daemon=True
+                        ).start()
+            except Exception as e:
+                log(f"qwen finish error: {e}")
+        self._state = None
+        self._prev_stable_len = 0
+
+    def needs_manual_reset(self):
+        return False  # built-in 30s sliding window handles context
+
+
+ENGINES = {
+    "parakeet": lambda: ParakeetEngine("v2"),
+    "parakeet-v3": lambda: ParakeetEngine("v3"),
+    "qwen": lambda: QwenEngine("0.6b"),
+    "qwen-1.7b": lambda: QwenEngine("1.7b"),
+}
+
+
+# ── Streaming Transcription Loop ─────────────────────────────────────────────
+SILENCE_STREAK_RESET = 4
+
+
+def transcription_loop(interval):
+    global current_engine
+
+    broadcast({"type": "status", "content": "Listening..."})
+    log("Listening - speak into your microphone (streaming mode)")
+
+    with engine_lock:
+        engine = current_engine
+
+    engine.start()
+
+    update_count = 0
+    total_audio_sec = 0.0
+    total_infer_ms = 0.0
+    prev_text = ""
+    silence_streak = 0
 
     while running:
         time.sleep(interval)
         if paused:
-            drain_buffer()  # discard audio while paused
+            drain_buffer()
             continue
+
+        # Check for engine switch
+        with engine_lock:
+            if current_engine is not engine:
+                log("Engine switch detected, transitioning...")
+                engine.stop()
+                engine = current_engine
+                engine.start()
+                prev_text = ""
+                silence_streak = 0
+                update_count = 0
+                total_audio_sec = 0.0
+                total_infer_ms = 0.0
+                broadcast({"type": "status", "content": f"Switched to {engine.name}"})
+                continue
+
         chunk = drain_buffer()
         if chunk is None or len(chunk) < 800:
             silence_streak += 1
-            if silence_streak >= SILENCE_STREAK_RESET and session_chunks > 0:
-                ctx, transcriber = reset_stream("sustained silence")
+            if silence_streak >= SILENCE_STREAK_RESET and engine.needs_manual_reset():
+                engine.reset()
+                silence_streak = 0
             continue
 
         rms = float(np.sqrt(np.mean(chunk ** 2)))
         if rms < SILENCE_RMS:
             silence_streak += 1
-            if silence_streak >= SILENCE_STREAK_RESET and session_chunks > 0:
-                ctx, transcriber = reset_stream("sustained silence")
+            if silence_streak >= SILENCE_STREAK_RESET and engine.needs_manual_reset():
+                engine.reset()
+                silence_streak = 0
             continue
 
         silence_streak = 0
-        session_chunks += 1
-
-        # Periodic reset to prevent decoder state drift
-        if session_chunks >= MAX_STREAM_CHUNKS:
-            ctx, transcriber = reset_stream(f"drift prevention after {MAX_STREAM_CHUNKS} chunks")
-
         audio_sec = len(chunk) / SAMPLE_RATE
-        audio_mx = mx.array(chunk)
 
         t0 = time.perf_counter()
         try:
-            transcriber.add_audio(audio_mx)
+            stable, draft = engine.feed(chunk)
         except Exception as e:
-            log(f"streaming error: {e}")
-            ctx, transcriber = reset_stream("error recovery")
+            log(f"engine error: {e}")
+            try:
+                engine.reset()
+            except Exception:
+                pass
             continue
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
@@ -233,44 +437,27 @@ def transcription_loop(model, interval):
         total_audio_sec += audio_sec
         total_infer_ms += elapsed_ms
 
-        # Extract finalized and draft text
-        finalized_tokens = transcriber.finalized_tokens
-        draft_tokens = transcriber.draft_tokens
-
-        fin_text = "".join(t.text for t in finalized_tokens).strip()
-        draft_text = "".join(t.text for t in draft_tokens).strip()
-
-        full_text = f"{fin_text} {draft_text}".strip()
+        full_text = f"{stable} {draft}".strip()
         if not full_text or full_text == prev_text:
             continue
         prev_text = full_text
 
         broadcast({
             "type": "stream",
-            "finalized": fin_text,
-            "draft": draft_text,
+            "finalized": stable,
+            "draft": draft,
         })
-
-        # Save newly finalized text to disk + Grafana
-        new_fin_count = len(finalized_tokens)
-        if new_fin_count > prev_finalized_count:
-            new_text = "".join(
-                t.text for t in finalized_tokens[prev_finalized_count:]
-            ).strip()
-            if new_text:
-                save_transcript(new_text)
-                threading.Thread(
-                    target=push_annotation, args=(new_text,), daemon=True
-                ).start()
-            prev_finalized_count = new_fin_count
 
         avg_ms = total_infer_ms / update_count
         rtf = (total_infer_ms / 1000) / total_audio_sec if total_audio_sec > 0 else 0
         log(
             f"  [{elapsed_ms:.0f}ms | avg {avg_ms:.0f}ms | "
-            f"RTF={rtf:.4f} | s{session_chunks}/{MAX_STREAM_CHUNKS}] "
-            f"{fin_text[-50:]}|{draft_text[:35]}"
+            f"RTF={rtf:.4f} | {engine.name}] "
+            f"{stable[-50:]}|{draft[:35]}"
         )
+
+    # Clean shutdown
+    engine.stop()
 
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
@@ -303,7 +490,7 @@ body{
 .indicator.off{background:#555;animation:none}
 .indicator.on{animation:pulse 2.5s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:0.3}50%{opacity:1}}
-.topbar .controls{display:flex;gap:0.5rem}
+.topbar .controls{display:flex;gap:0.5rem;align-items:center}
 .btn{
   background:#1a1a1a;border:1px solid #2a2a2a;color:#888;
   padding:0.35rem 0.9rem;border-radius:4px;font-size:0.65rem;
@@ -313,6 +500,15 @@ body{
 .btn:hover{background:#222;color:#ccc;border-color:#444}
 .btn.active{background:#1a2e1a;border-color:#2a4a2a;color:#4ade80}
 .btn.danger:hover{background:#2e1a1a;border-color:#4a2a2a;color:#f87171}
+select.engine-select{
+  background:#1a1a1a;border:1px solid #2a2a2a;color:#888;
+  padding:0.35rem 0.5rem;border-radius:4px;font-size:0.65rem;
+  cursor:pointer;letter-spacing:0.04em;
+  font-weight:500;outline:none;
+  -webkit-appearance:none;appearance:none;
+}
+select.engine-select:hover{background:#222;color:#ccc;border-color:#444}
+select.engine-select:focus{border-color:#4ade80}
 .content{
   flex:1;display:flex;align-items:flex-end;
   overflow:hidden;
@@ -341,6 +537,12 @@ body{
     <span class="title">textstream</span>
   </div>
   <div class="controls">
+    <select class="engine-select" id="engineSelect" onchange="switchEngine(this.value)">
+      <option value="qwen">Qwen3 0.6B</option>
+      <option value="qwen-1.7b">Qwen3 1.7B</option>
+      <option value="parakeet">Parakeet v2</option>
+      <option value="parakeet-v3">Parakeet v3</option>
+    </select>
     <button class="btn active" id="toggleBtn" onclick="togglePause()">Listening</button>
     <button class="btn danger" onclick="stopServer()">Stop</button>
   </div>
@@ -356,6 +558,7 @@ const textEl=document.getElementById('text');
 const statusEl=document.getElementById('status');
 const toggleBtn=document.getElementById('toggleBtn');
 const ind=document.getElementById('ind');
+const engineSelect=document.getElementById('engineSelect');
 let isPaused=false;
 const MAX_CHARS=500;
 
@@ -372,6 +575,12 @@ function stopServer(){
     fetch('/stop');
     document.body.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#444;font-size:1.2rem">TextStream stopped.</div>';
   }
+}
+function switchEngine(eng){
+  statusEl.style.display='block';
+  statusEl.textContent='Switching to '+eng+'...';
+  textEl.innerHTML='';
+  fetch('/switch?engine='+encodeURIComponent(eng));
 }
 
 const src=new EventSource('/stream');
@@ -394,6 +603,8 @@ src.onmessage=e=>{
   }else if(d.type==='status'){
     statusEl.style.display='block';
     statusEl.textContent=d.content;
+  }else if(d.type==='engine'){
+    engineSelect.value=d.engine;
   }
 };
 src.onerror=()=>{
@@ -405,6 +616,9 @@ function esc(s){
   d.textContent=s;
   return d.innerHTML;
 }
+
+// Set initial engine from server
+fetch('/engine').then(r=>r.json()).then(d=>{engineSelect.value=d.engine});
 </script>
 </body>
 </html>"""
@@ -449,6 +663,56 @@ class Handler(BaseHTTPRequestHandler):
             log("Stop requested via /stop endpoint")
             threading.Thread(target=lambda: os.kill(os.getpid(), signal.SIGTERM), daemon=True).start()
 
+        elif self.path.startswith("/switch"):
+            global current_engine
+            from urllib.parse import urlparse, parse_qs
+            params = parse_qs(urlparse(self.path).query)
+            engine_name = params.get("engine", [""])[0]
+
+            if engine_name not in ENGINES:
+                self.send_response(400)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(f"Unknown engine: {engine_name}".encode())
+                return
+
+            with engine_lock:
+                if current_engine.name == engine_name:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"already active")
+                    return
+
+                log(f"Switching engine: {current_engine.name} -> {engine_name}")
+                new_engine = ENGINES[engine_name]()
+                # Pre-load model in background to minimize gap
+                try:
+                    new_engine.load()
+                except Exception as e:
+                    self.send_response(500)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(f"Failed to load {engine_name}: {e}".encode())
+                    log(f"Engine load failed: {e}")
+                    return
+                current_engine = new_engine
+
+            broadcast({"type": "engine", "engine": engine_name})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(f"switched to {engine_name}".encode())
+            log(f"Engine switched to {engine_name}")
+
+        elif self.path == "/engine":
+            with engine_lock:
+                name = current_engine.name if current_engine else "unknown"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"engine": name}).encode())
+
         elif self.path == "/stream":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -484,17 +748,18 @@ class Handler(BaseHTTPRequestHandler):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    global running
+    global running, current_engine
 
     parser = argparse.ArgumentParser(description="TextStream - live speech to text")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument(
-        "--model", default="v2", choices=["v2", "v3"],
-        help="v2=English, v3=25 languages (default: v2)",
+        "--engine", default="qwen",
+        choices=list(ENGINES.keys()),
+        help="ASR engine (default: qwen)",
     )
     parser.add_argument(
         "--interval", type=float, default=DEFAULT_INTERVAL,
-        help="Seconds between streaming updates (default: 1.5, min safe: 1.0)",
+        help=f"Seconds between streaming updates (default: {DEFAULT_INTERVAL})",
     )
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--no-grafana", action="store_true", help="Disable Grafana push")
@@ -504,15 +769,9 @@ def main():
         global push_annotation
         push_annotation = lambda text: None
 
-    model_map = {
-        "v2": "mlx-community/parakeet-tdt-0.6b-v2",
-        "v3": "mlx-community/parakeet-tdt-0.6b-v3",
-    }
-
-    log(f"Loading Parakeet {args.model}...")
-    from parakeet_mlx import from_pretrained
-    model = from_pretrained(model_map[args.model])
-    log("Model ready")
+    # Create and load initial engine
+    current_engine = ENGINES[args.engine]()
+    current_engine.load()
 
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
@@ -525,7 +784,7 @@ def main():
     log("Microphone active")
 
     t = threading.Thread(
-        target=transcription_loop, args=(model, args.interval), daemon=True
+        target=transcription_loop, args=(args.interval,), daemon=True
     )
     t.start()
 
