@@ -691,6 +691,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("X-Accel-Buffering", "no")  # Disable nginx/proxy buffering
             self.end_headers()
             self.wfile.write(b"retry: 3000\n\n")  # Auto-reconnect hint for EventSource
+            # Send current status so new subscribers don't see stale "Loading model..."
+            with engine_lock:
+                eng_name = current_engine.name if current_engine else "unknown"
+            welcome = f"data: {json.dumps({'type': 'status', 'content': 'Listening...'})}\n\n"
+            self.wfile.write(welcome.encode())
+            self.wfile.write(f"data: {json.dumps({'type': 'engine', 'engine': eng_name})}\n\n".encode())
             self.wfile.flush()
 
             q = queue.Queue(maxsize=50)
