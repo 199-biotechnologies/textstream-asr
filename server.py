@@ -48,6 +48,7 @@ buffer_lock = threading.Lock()
 subscribers = []
 sub_lock = threading.Lock()
 running = True
+paused = False
 
 
 def log(msg):
@@ -151,8 +152,18 @@ def transcription_loop(model, interval):
     broadcast({"type": "status", "content": "Listening..."})
     log("Listening - speak into your microphone (streaming mode)")
 
+    from parakeet_mlx.parakeet import DecodingConfig, Beam
+
+    decoding = DecodingConfig(
+        decoding=Beam(beam_size=5, duration_reward=0.7),
+    )
+
     def new_stream():
-        return model.transcribe_stream(context_size=(256, 256), depth=2)
+        return model.transcribe_stream(
+            context_size=(384, 384),
+            depth=4,
+            decoding_config=decoding,
+        )
 
     ctx = new_stream()
     transcriber = ctx.__enter__()
@@ -182,6 +193,9 @@ def transcription_loop(model, interval):
 
     while running:
         time.sleep(interval)
+        if paused:
+            drain_buffer()  # discard audio while paused
+            continue
         chunk = drain_buffer()
         if chunk is None or len(chunk) < 800:
             silence_streak += 1
@@ -273,11 +287,39 @@ body{
   background:#09090b;
   color:#e8e8e8;
   font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter',sans-serif;
-  display:flex;align-items:flex-end;justify-content:flex-start;
+  display:flex;flex-direction:column;
+}
+.topbar{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:0.8rem 1.5rem;
+  background:#111;
+  border-bottom:1px solid #1a1a1a;
+  flex-shrink:0;
+  user-select:none;
+}
+.topbar .left{display:flex;align-items:center;gap:0.6rem}
+.topbar .title{font-size:0.7rem;color:#555;letter-spacing:0.12em;text-transform:uppercase;font-weight:600}
+.indicator{width:6px;height:6px;border-radius:50%;background:#34d399;transition:background 0.3s}
+.indicator.off{background:#555;animation:none}
+.indicator.on{animation:pulse 2.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:0.3}50%{opacity:1}}
+.topbar .controls{display:flex;gap:0.5rem}
+.btn{
+  background:#1a1a1a;border:1px solid #2a2a2a;color:#888;
+  padding:0.35rem 0.9rem;border-radius:4px;font-size:0.65rem;
+  cursor:pointer;letter-spacing:0.06em;text-transform:uppercase;
+  font-weight:500;transition:all 0.2s;
+}
+.btn:hover{background:#222;color:#ccc;border-color:#444}
+.btn.active{background:#1a2e1a;border-color:#2a4a2a;color:#4ade80}
+.btn.danger:hover{background:#2e1a1a;border-color:#4a2a2a;color:#f87171}
+.content{
+  flex:1;display:flex;align-items:flex-end;
+  overflow:hidden;
 }
 .wrap{
   width:100%;max-width:900px;
-  padding:0 3rem 5rem;
+  padding:0 2.5rem 3rem;
   margin:0 auto;
 }
 #text{
@@ -288,66 +330,67 @@ body{
   text-align:left;
   word-wrap:break-word;
 }
-#text .draft{
-  color:#666;
-}
-#status{
-  font-size:1.1rem;
-  color:#444;
-  font-weight:300;
-  padding-bottom:1rem;
-}
-.bar{
-  position:fixed;bottom:1.4rem;right:2rem;
-  display:flex;align-items:center;gap:0.4rem;
-  font-size:0.55rem;color:#2a2a2a;letter-spacing:0.12em;text-transform:uppercase;
-  font-weight:500;
-}
-.dot{
-  width:4px;height:4px;border-radius:50%;
-  background:#34d399;
-  animation:pulse 3s ease-in-out infinite;
-}
-@keyframes pulse{0%,100%{opacity:0.2}50%{opacity:1}}
+#text .draft{color:#555}
+#status{font-size:1rem;color:#444;font-weight:300;padding-bottom:0.8rem}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <div id="status">Loading model...</div>
-  <div id="text"></div>
+<div class="topbar">
+  <div class="left">
+    <div class="indicator on" id="ind"></div>
+    <span class="title">textstream</span>
+  </div>
+  <div class="controls">
+    <button class="btn active" id="toggleBtn" onclick="togglePause()">Listening</button>
+    <button class="btn danger" onclick="stopServer()">Stop</button>
+  </div>
 </div>
-<div class="bar"><div class="dot"></div><span>textstream</span></div>
+<div class="content">
+  <div class="wrap">
+    <div id="status">Loading model...</div>
+    <div id="text"></div>
+  </div>
+</div>
 <script>
 const textEl=document.getElementById('text');
 const statusEl=document.getElementById('status');
-let shownFin=0;
-const MAX_CHARS=400;
+const toggleBtn=document.getElementById('toggleBtn');
+const ind=document.getElementById('ind');
+let isPaused=false;
+const MAX_CHARS=500;
+
+function togglePause(){
+  isPaused=!isPaused;
+  fetch(isPaused?'/pause':'/resume');
+  toggleBtn.textContent=isPaused?'Paused':'Listening';
+  toggleBtn.classList.toggle('active',!isPaused);
+  ind.classList.toggle('on',!isPaused);
+  ind.classList.toggle('off',isPaused);
+}
+function stopServer(){
+  if(confirm('Stop TextStream?')){
+    fetch('/stop');
+    document.body.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#444;font-size:1.2rem">TextStream stopped.</div>';
+  }
+}
 
 const src=new EventSource('/stream');
 src.onmessage=e=>{
   const d=JSON.parse(e.data);
-
   if(d.type==='stream'){
     statusEl.style.display='none';
     const fin=d.finalized||'';
     const draft=d.draft||'';
-
-    // Build visible text: tail of finalized + draft
-    // Only show last MAX_CHARS of finalized for performance
     let visFin=fin;
     if(visFin.length>MAX_CHARS){
-      // Cut at a space boundary
       const cut=visFin.indexOf(' ',visFin.length-MAX_CHARS);
       visFin=cut>0?visFin.slice(cut+1):visFin.slice(-MAX_CHARS);
     }
-
-    // Set innerHTML once: finalized as plain text, draft in span
     if(draft){
       textEl.innerHTML=esc(visFin)+'<span class="draft"> '+esc(draft)+'</span>';
     }else{
       textEl.textContent=visFin;
     }
-
   }else if(d.type==='status'){
     statusEl.style.display='block';
     statusEl.textContent=d.content;
@@ -380,6 +423,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(HTML.encode())
+
+        elif self.path == "/pause":
+            global paused
+            paused = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"paused")
+            log("Paused")
+
+        elif self.path == "/resume":
+            paused = False
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"resumed")
+            log("Resumed")
 
         elif self.path == "/stop":
             self.send_response(200)
