@@ -303,6 +303,7 @@ class QwenEngine(ASREngine):
             sample_rate=SAMPLE_RATE,
             unfixed_chunk_num=2,
             unfixed_token_num=5,
+            language="English",
         )
         self._prev_stable_len = 0
 
@@ -353,8 +354,6 @@ class QwenEngine(ASREngine):
 
 
 ENGINES = {
-    "parakeet": lambda: ParakeetEngine("v2"),
-    "parakeet-v3": lambda: ParakeetEngine("v3"),
     "qwen": lambda: QwenEngine("0.6b"),
     "qwen-1.7b": lambda: QwenEngine("1.7b"),
 }
@@ -540,8 +539,6 @@ select.engine-select:focus{border-color:#4ade80}
     <select class="engine-select" id="engineSelect" onchange="switchEngine(this.value)">
       <option value="qwen">Qwen3 0.6B</option>
       <option value="qwen-1.7b">Qwen3 1.7B</option>
-      <option value="parakeet">Parakeet v2</option>
-      <option value="parakeet-v3">Parakeet v3</option>
     </select>
     <button class="btn active" id="toggleBtn" onclick="togglePause()">Listening</button>
     <button class="btn danger" onclick="stopServer()">Stop</button>
