@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""TextStream — Live speech-to-text streaming on Apple Silicon.
+"""TextStream — Local real-time speech-to-text server for Apple Silicon.
 
-Streams live microphone audio through Qwen3-ASR, displays results in a
-browser (SSE), optionally pushes Grafana annotations, and saves daily
-transcripts to ~/Documents/textstream/transcripts/YYYY-MM-DD/.
+Captures microphone audio, filters with Silero VAD, transcribes with
+Qwen3-ASR on MLX, and streams results over SSE at localhost:7890/stream.
+Any app or script can subscribe for near real-time transcription.
 
 Usage:
-    textstream                          # Start with Qwen3-ASR 0.6B (default)
-    textstream --engine qwen-1.7b       # Use Qwen3-ASR 1.7B (higher accuracy)
+    textstream                          # Start server, open browser UI
+    textstream --no-browser             # Headless — SSE server only
+    textstream --engine qwen-1.7b       # Larger model, lower WER
     textstream --vad-threshold 0.5      # Stricter voice activity detection
-    textstream --interval 2.5           # Seconds between streaming updates
     textstream --port 8080              # Custom port
 """
 
@@ -69,9 +69,9 @@ def drain_buffer():
     with buffer_lock:
         if not audio_chunks:
             return None
-        chunk = np.concatenate(audio_chunks)
+        chunks = audio_chunks
         audio_chunks = []
-    return chunk
+    return np.concatenate(chunks)
 
 
 # ── SSE Broadcast ─────────────────────────────────────────────────────────────
@@ -82,6 +82,13 @@ def broadcast(event_data):
         for q in subscribers:
             try:
                 q.put_nowait(payload)
+            except queue.Full:
+                # Drop oldest event for slow clients
+                try:
+                    q.get_nowait()
+                    q.put_nowait(payload)
+                except Exception:
+                    dead.append(q)
             except Exception:
                 dead.append(q)
         for d in dead:
@@ -114,6 +121,15 @@ def push_annotation(text):
 TRANSCRIPT_DIR = Path.home() / "Documents" / "textstream" / "transcripts"
 _transcript_file = None
 _transcript_lock = threading.Lock()
+
+
+def close_transcript():
+    with _transcript_lock:
+        global _transcript_file
+        if _transcript_file and not _transcript_file.closed:
+            _transcript_file.flush()
+            _transcript_file.close()
+            _transcript_file = None
 
 
 def get_transcript_file():
@@ -303,8 +319,12 @@ def transcription_loop(interval, vad_threshold):
     prev_text = ""
     silence_streak = 0
 
+    next_tick = time.monotonic() + interval
     while running:
-        time.sleep(interval)
+        now = time.monotonic()
+        sleep_for = max(0, next_tick - now)
+        time.sleep(sleep_for)
+        next_tick = time.monotonic() + interval
         if paused:
             drain_buffer()
             continue
@@ -603,18 +623,20 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(b"already active")
                     return
 
-                log(f"Switching engine: {current_engine.name} -> {engine_name}")
-                new_engine = ENGINES[engine_name]()
-                # Pre-load model in background to minimize gap
-                try:
-                    new_engine.load()
-                except Exception as e:
-                    self.send_response(500)
-                    self.send_header("Content-Type", "text/plain")
-                    self.end_headers()
-                    self.wfile.write(f"Failed to load {engine_name}: {e}".encode())
-                    log(f"Engine load failed: {e}")
-                    return
+            # Load model outside lock to avoid blocking transcription loop
+            log(f"Switching engine: loading {engine_name}...")
+            new_engine = ENGINES[engine_name]()
+            try:
+                new_engine.load()
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(f"Failed to load {engine_name}: {e}".encode())
+                log(f"Engine load failed: {e}")
+                return
+
+            with engine_lock:
                 current_engine = new_engine
 
             broadcast({"type": "engine", "engine": engine_name})
@@ -639,7 +661,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "keep-alive")
             self.end_headers()
 
-            q = queue.Queue()
+            q = queue.Queue(maxsize=50)
             with sub_lock:
                 subscribers.append(q)
             try:
@@ -733,12 +755,20 @@ def main():
 
     def shutdown(sig, frame):
         global running
+        if not running:
+            return
         running = False
         log("\nStopping...")
-        stream.stop()
-        stream.close()
-        httpd.shutdown()
-        sys.exit(0)
+
+        def _cleanup():
+            stream.stop()
+            stream.close()
+            close_transcript()
+            httpd.shutdown()
+
+        # Run cleanup in a thread to avoid deadlock when called from signal handler
+        # (httpd.shutdown() waits for serve_forever() which runs on main thread)
+        threading.Thread(target=_cleanup, daemon=True).start()
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
