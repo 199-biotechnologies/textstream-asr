@@ -19,7 +19,7 @@ Built for real-time transcription during calls, meetings, or recording sessions.
 ## Install
 
 ```bash
-pip install textstream
+pip install textstream-asr
 ```
 
 Requires Apple Silicon (M1 or later) and Python 3.10+. MLX doesn't run on Intel or Linux.

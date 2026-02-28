@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "textstream"
+name = "textstream-asr"
 version = "0.1.0"
 description = "Live speech-to-text streaming on Apple Silicon"
 readme = "README.md"
