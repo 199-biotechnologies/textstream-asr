@@ -34,7 +34,7 @@ import sounddevice as sd
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SAMPLE_RATE = 16000
-SILENCE_RMS = 0.012
+SILENCE_RMS = 0.015  # raised to reject music/ambient noise better
 DEFAULT_PORT = 7890
 DEFAULT_INTERVAL = 2.5
 
@@ -276,12 +276,21 @@ class ParakeetEngine(ASREngine):
 class QwenEngine(ASREngine):
     description = "Qwen3-ASR 0.6B — accurate (~2.3% WER), built-in context window"
 
+    # Known hallucination patterns (model regurgitates its chat system prompt on noise)
+    HALLUCINATION_PATTERNS = [
+        "you are a helpful assistant",
+        "i am a helpful assistant",
+        "as an ai",
+        "as a language model",
+    ]
+
     def __init__(self, model_size="0.6b"):
         self.model_size = model_size
         self.name = "qwen" if model_size == "0.6b" else "qwen-1.7b"
         self.session = None
         self._state = None
         self._prev_stable_len = 0
+        self._hallucination_streak = 0
 
     def load(self):
         model_map = {
@@ -307,6 +316,10 @@ class QwenEngine(ASREngine):
         )
         self._prev_stable_len = 0
 
+    def _is_hallucination(self, text):
+        lower = text.lower().strip()
+        return any(p in lower for p in self.HALLUCINATION_PATTERNS)
+
     def feed(self, audio_np):
         self._state = self.session.feed_audio(audio_np, self._state)
 
@@ -318,17 +331,29 @@ class QwenEngine(ASREngine):
         if len(full) > len(stable):
             draft = full[len(stable):].strip()
 
+        # Detect hallucination — model regurgitates system prompt on noise/music
+        if self._is_hallucination(draft) or self._is_hallucination(full[-60:] if full else ""):
+            self._hallucination_streak += 1
+            if self._hallucination_streak >= 2:
+                log("  -- hallucination detected, resetting stream --")
+                self.stop()
+                self.start()
+                return "", ""
+            return stable, ""  # suppress the hallucinated draft
+        else:
+            self._hallucination_streak = 0
+
         # Track newly finalized text for persistence
         new_text = ""
         if len(stable) > self._prev_stable_len:
             new_text = stable[self._prev_stable_len:].strip()
+            # Don't persist hallucinated text
+            if new_text and not self._is_hallucination(new_text):
+                save_transcript(new_text)
+                threading.Thread(
+                    target=push_annotation, args=(new_text,), daemon=True
+                ).start()
             self._prev_stable_len = len(stable)
-
-        if new_text:
-            save_transcript(new_text)
-            threading.Thread(
-                target=push_annotation, args=(new_text,), daemon=True
-            ).start()
 
         return stable, draft
 
